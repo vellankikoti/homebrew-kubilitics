@@ -1,0 +1,179 @@
+# Self-updating Homebrew tap for Kubilitics.
+#
+# Design (Pattern E): this workflow polls vellankikoti/kubilitics for its
+# latest release, rewrites Casks/kubilitics.rb, and commits using this
+# repo's OWN default GITHUB_TOKEN. Zero cross-repo secrets. No PAT, no
+# GitHub App, no deploy key.
+#
+# Triggers:
+#   - schedule (every 30 min): the invariant. Tap stays fresh even if
+#     upstream's dispatch step breaks, is removed, or was never wired.
+#   - repository_dispatch { type: kubilitics-release }: fired optionally
+#     by vellankikoti/kubilitics's post-release workflow for instant
+#     updates. Convenience only — the schedule is load-bearing.
+#   - workflow_dispatch: manual kick from the Actions tab.
+#
+# Safety:
+#   - Idempotent: if the cask is already at the latest version + matching
+#     SHA, the workflow exits without a commit. Schedule re-runs are
+#     harmless.
+#   - Release gate: skips pre-releases (-rc, -beta) — only stable tags
+#     bump the cask.
+#   - SHA verification: the DMG is downloaded and re-hashed in-workflow
+#     and cross-checked against checksums.txt. If upstream's
+#     checksums.txt is corrupted, we refuse to commit.
+
+name: Sync upstream release
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 min, UTC
+  repository_dispatch:
+    types: [kubilitics-release]
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: 'Force a specific tag (e.g. v1.1.0). Empty = use latest.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # only this repo; default GITHUB_TOKEN, auto-scoped.
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Resolve upstream release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # default; public-repo read is free.
+          FORCE_TAG: ${{ github.event.inputs.force_tag }}
+          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${FORCE_TAG:-}" ]; then
+            TAG="$FORCE_TAG"
+            echo "Using manually forced tag: $TAG"
+          elif [ -n "${DISPATCH_TAG:-}" ]; then
+            TAG="$DISPATCH_TAG"
+            echo "Using dispatched tag: $TAG"
+          else
+            TAG=$(gh release view --repo vellankikoti/kubilitics \
+              --json tagName -q '.tagName')
+            echo "Latest upstream tag: $TAG"
+          fi
+
+          # Skip pre-releases (we only track stable GA).
+          if [[ "$TAG" =~ -(rc|beta|alpha|dev|pre) ]]; then
+            echo "Pre-release tag $TAG — skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Short-circuit if cask already matches
+        if: steps.release.outputs.skip != 'true'
+        id: precheck
+        env:
+          TARGET_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          CURRENT=$(awk -F'"' '/^  version "/ {print $2; exit}' Casks/kubilitics.rb || echo "")
+          echo "Cask currently at: ${CURRENT:-<none>}"
+          echo "Upstream latest:   $TARGET_VERSION"
+          if [ "$CURRENT" = "$TARGET_VERSION" ]; then
+            echo "No-op — cask already at $TARGET_VERSION."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch checksums and verify DMG
+        if: steps.release.outputs.skip != 'true' && steps.precheck.outputs.changed == 'true'
+        id: verify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          WORK=$(mktemp -d)
+
+          gh release download "$TAG" \
+            --repo vellankikoti/kubilitics \
+            --pattern 'checksums.txt' \
+            --dir "$WORK"
+
+          DMG_NAME="Kubilitics_${VERSION}_universal.dmg"
+          CLAIMED_SHA=$(awk -v n="$DMG_NAME" '$2 == n {print $1}' "$WORK/checksums.txt")
+          if [ -z "$CLAIMED_SHA" ]; then
+            echo "::error::$DMG_NAME not in checksums.txt"
+            cat "$WORK/checksums.txt"
+            exit 1
+          fi
+
+          # Trust-but-verify: re-download and re-hash the DMG. Guards against
+          # a tampered checksums.txt or a bad release mirror.
+          gh release download "$TAG" \
+            --repo vellankikoti/kubilitics \
+            --pattern "$DMG_NAME" \
+            --dir "$WORK"
+          ACTUAL_SHA=$(shasum -a 256 "$WORK/$DMG_NAME" | awk '{print $1}')
+
+          if [ "$CLAIMED_SHA" != "$ACTUAL_SHA" ]; then
+            echo "::error::SHA mismatch for $DMG_NAME"
+            echo "  checksums.txt: $CLAIMED_SHA"
+            echo "  re-hashed:     $ACTUAL_SHA"
+            exit 1
+          fi
+
+          echo "Verified SHA: $ACTUAL_SHA"
+          echo "sha=$ACTUAL_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Rewrite Casks/kubilitics.rb
+        if: steps.release.outputs.skip != 'true' && steps.precheck.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          SHA: ${{ steps.verify.outputs.sha }}
+        run: |
+          set -euo pipefail
+          sed -i \
+            -e "s|^  version \"[^\"]*\"|  version \"${VERSION}\"|" \
+            -e "s|^  sha256 \"[^\"]*\"|  sha256 \"${SHA}\"|" \
+            Casks/kubilitics.rb
+
+          # Sanity: re-parse as Ruby before committing.
+          ruby -c Casks/kubilitics.rb
+
+      - name: Commit and push
+        if: steps.release.outputs.skip != 'true' && steps.precheck.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/kubilitics.rb
+
+          if git diff --staged --quiet; then
+            echo "No diff after rewrite — unexpected, exiting clean."
+            exit 0
+          fi
+
+          git commit -m "kubilitics ${VERSION}" \
+            -m "Auto-synced from https://github.com/vellankikoti/kubilitics/releases/tag/${TAG}"
+          git push
