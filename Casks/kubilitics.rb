@@ -10,8 +10,8 @@
 #   brew install --cask kubilitics
 
 cask "kubilitics" do
-  version "1.2.0"
-  sha256 "994abf3f6f08561a1f3abc064ad3c884f06acd102bc7144139c69dabc7ab7db7"
+  version "1.2.4"
+  sha256 "e31312fab178a76b5887feec76a8f7ad16ec00f5637fda3b84461cabc4d55770"
 
   url "https://github.com/vellankikoti/kubilitics/releases/download/v#{version}/Kubilitics_#{version}_universal.dmg"
   name "Kubilitics"
